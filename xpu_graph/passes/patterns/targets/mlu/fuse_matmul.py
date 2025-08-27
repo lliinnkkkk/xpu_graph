@@ -1,4 +1,5 @@
 import os
+from functools import partial
 from typing import Optional, Tuple, Union
 
 import torch
@@ -146,8 +147,26 @@ class FusedMatMulReplacement(nn.Module):
         super().__init__()
         self.fast_act = fast_act
 
+    # not replace with tmo mm, reserve for inductor to opt
+    def bypassAten(self, inputs, input_shape, weight, weight_shape, trans_b, bias, act):
+        assert not trans_b
+        # input last dim must be contiguous.
+        if inputs.stride()[-1] != 1:
+            inputs = inputs.contiguous()
+
+        output = torch.matmul(inputs, weight)
+        if bias is not None:
+            output = output + bias
+
+        if act == "sigmoid":
+            output = torch.sigmoid(output)
+        return output
+
     def forward(self, inputs, input_shape, weight, weight_shape, trans_b, bias, act):
         import torch_mlu_ops
+
+        if not trans_b:
+            return self.bypassAten(inputs, input_shape, weight, weight_shape, trans_b, bias, act)
 
         # TODO(jyj): waiting for tmo version update
         tmp_act = act
@@ -158,42 +177,28 @@ class FusedMatMulReplacement(nn.Module):
         if inputs.stride()[-1] != 1:
             inputs = inputs.contiguous()
 
-        if bias != None:
+        # use tmo mm
+        tmo_matmul_partial = partial(torch_mlu_ops.matmul, bias=None, c=None, beta=0.0)
+        if bias is not None:
             if isinstance(bias, int):
-                dim = weight.shape[1] if trans_b == False else weight.shape[0]
+                dim = weight.shape[1] if not trans_b else weight.shape[0]
                 bias = torch.tensor([bias] * dim, device=inputs.device, dtype=inputs.dtype)
             bias_shape = bias.shape
             if (len(bias_shape) == 2) & (bias_shape[0] == 1):
                 bias = bias.view(-1)
                 bias_shape = bias.shape
             if len(bias_shape) == 1:
-                output = torch_mlu_ops.matmul(
-                    inputs,
-                    weight,
-                    bias,
-                    None,
-                    tmp_act,
-                    1.0,
-                    0.0,
-                    self.fast_act,
-                    False,
-                    trans_b=trans_b,
-                )
-                if act == "sigmoid":
-                    return torch.sigmoid(output)
-                return output
+                tmo_matmul_partial = partial(torch_mlu_ops.matmul, bias=bias, c=None, beta=0.0)
+            else:
+                tmo_matmul_partial = partial(torch_mlu_ops.matmul, bias=None, c=bias, beta=1.0)
 
-        # bias 2d or None
-        output = torch_mlu_ops.matmul(
+        output = tmo_matmul_partial(
             inputs,
             weight,
-            None,
-            bias,
-            tmp_act,
-            1.0,
-            0.0 if bias is None else 1.0,
-            self.fast_act,
-            False,
+            act_mode=tmp_act,
+            alpha=1.0,
+            fast_act=self.fast_act,
+            trans_a=False,
             trans_b=trans_b,
         )
         if act == "sigmoid":
